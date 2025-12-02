@@ -5,6 +5,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import tldextract
 from flask import flash
+import time
 
 app = Flask(__name__)
 
@@ -76,14 +77,74 @@ def crawl_and_build_graph(seed_urls, max_pages=MAX_PAGES, max_depth=CRAWL_DEPTH)
         if html is None:
             continue
 
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+
+        G.add_node(url, domain=domain(url), text=text)
+
         outlinks = extract_links(url, html)[:MAX_OUTLINKS_PER_PAGE]
-        G.add_node(url, domain=domain(url))
+
         for l in outlinks:
             G.add_node(l, domain=domain(l))
             G.add_edge(url, l)
             if l not in visited:
                 frontier.append((l, depth + 1))
     return G
+
+ # On ajoute une fonction de score textuel
+
+def compute_textual_score(G: nx.DiGraph, query):
+    # --- Normalisation robuste de la requête ---
+    # Si c’est déjà une liste → on rejoint proprement
+    if isinstance(query, list):
+        query = " ".join(query)
+
+    # À ce stade query est assurément une string
+    query = query.lower().strip()
+    terms = query.split()   # liste de tokens
+
+    N = len(G.nodes)
+
+    # --- Document Frequency ---
+    df = {t: 0 for t in terms}
+    for _, data in G.nodes(data=True):
+        text = data.get("text", "").lower()
+        for t in terms:
+            if t in text:
+                df[t] += 1
+
+    # --- TF-IDF scoring ---
+    scores = {}
+    for node, data in G.nodes(data=True):
+        text = data.get("text", "").lower()
+        score = 0.0
+        for t in terms:
+            tf = text.count(t)
+            if tf > 0 and df[t] > 0:
+                idf = 1 + (N / df[t])   # version simple du IDF
+                score += tf * idf
+        scores[node] = score
+
+    return scores
+
+
+def normalize_scores(scores):
+    if not scores:
+        return {}
+
+    max_val = max(scores.values())
+
+    if max_val == 0:
+        # Tous les scores sont nuls → renvoyer des zéros, pas diviser
+        return {k: 0 for k in scores}
+
+    return {k: v / max_val for k, v in scores.items()}
+
+def combine_scores(link_scores: dict, text_scores: dict, alpha: float = 0.5, beta: float = 0.5):
+    final = {}
+    for k in link_scores:
+        final[k] = alpha * link_scores[k] + beta * text_scores.get(k, 0)
+    return final
 
 
 def compute_pagerank(G: nx.DiGraph, damping: float = 0.85):
@@ -108,12 +169,27 @@ def index():
         seeds = [s.strip() for s in seeds_raw.splitlines() if s.strip()]
         query = request.form.get("query", "")
         scores = {}
+        G = crawl_and_build_graph(seeds)
         if critere == "PageRank":
-            G = crawl_and_build_graph(seeds)
+            start = time.time()
             pr = compute_pagerank(G)
-            scores["PageRank"] = sorted(pr.items(), key=lambda x: x[1], reverse=True)[:K]
+            pr = normalize_scores(pr)
+            text_scores = compute_textual_score(G, query,)
+            text_scores = normalize_scores(text_scores)
+            combined_scores = combine_scores(pr, text_scores, alpha=0.5, beta=0.5)
+            scores["PageRank"] = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)[:K]
+            end = time.time()
+            print(f"PageRank computed in {end - start:.2f} seconds.")
         elif critere == "HITS-autorite":
-            scores["HITS-autorite"] = sorted(compute_hits_autorite(crawl_and_build_graph(seeds)).items(), key=lambda x: x[1], reverse=True)[:K]
+            start = time.time()
+            hits = compute_hits_autorite(G)
+            hits = normalize_scores(hits)
+            text_scores = compute_textual_score(G, query)
+            text_scores = normalize_scores(text_scores)
+            combined_scores = combine_scores(hits, text_scores, alpha=0.5, beta=0.5)
+            scores["HITS-autorite"] = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)[:K]
+            end = time.time()
+            print(f"HITS authority computed in {end - start:.2f} seconds.")
         results = {"query": query, "scores": scores}
 
     return render_template("index.html", results=results)
